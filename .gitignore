@@ -1,0 +1,8 @@
+# La transmission ne se versionne pas : 15 Mo, le script la retelecharge.
+releves_klaxo3.csv
+*.csv
+
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
