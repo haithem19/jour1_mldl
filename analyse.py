@@ -21,8 +21,10 @@ import urllib.request
 
 import numpy as np
 import pandas as pd
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.compose import ColumnTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, precision_score, recall_score
 from sklearn.model_selection import GroupShuffleSplit, train_test_split
@@ -480,7 +482,7 @@ def phase8(df):
     print("\nPhase 4 (rappel / precision honnetes) apres cette decoupe :")
     print(f"  rappel = {100 * apres['recall']:.1f}   precision = {100 * apres['precision']:.1f}")
 
-    return idx_tr, idx_te
+    return idx_tr, idx_te, apres
 
 
 def phase9(df, idx_tr, idx_te):
@@ -660,6 +662,30 @@ def fusionner_shape(s):
     return "other" if s in SHAPE_RARES else s
 
 
+def encoder_ville(df, y, idx_tr_ref, m=500):
+    """Taux de canulars par ville, lisse, appris uniquement sur idx_tr_ref."""
+    ville = df["city"].fillna("inconnu")
+    train_stats = pd.DataFrame({"ville": ville.iloc[idx_tr_ref], "canular": y[idx_tr_ref]})
+    stats = train_stats.groupby("ville")["canular"].agg(["mean", "count"])
+    moyenne_globale = float(y[idx_tr_ref].mean())
+    stats["taux_lisse"] = (stats["count"] * stats["mean"] + m * moyenne_globale) / (stats["count"] + m)
+    return ville.map(stats["taux_lisse"]).fillna(moyenne_globale)
+
+
+def construire_x_finale(df, top3_manquants, duree_modele, duree_aberrante,
+                         shape_propre, heure_sin, heure_cos, city_taux):
+    x = preparer_honnete_base(df)
+    for c in top3_manquants:
+        x[f"{c}_manquant"] = df[c].isna().astype(int)
+    x["duration_seconds"] = duree_modele
+    x["duree_aberrante"] = duree_aberrante
+    x["shape"] = shape_propre.fillna("inconnu")
+    x["heure_sin"] = heure_sin
+    x["heure_cos"] = heure_cos
+    x["ville_taux_canular"] = city_taux
+    return x.drop(columns=["heure"])
+
+
 def phase12(df, idx_tr, idx_te, top3_manquants, duree_modele, duree_aberrante):
     titre("PHASE 12 - LA VILLE ET L'HEURE")
 
@@ -729,14 +755,337 @@ def phase12(df, idx_tr, idx_te, top3_manquants, duree_modele, duree_aberrante):
     cols_num = (["duration_seconds", "latitude", "longitude", "heure_sin", "heure_cos",
                  "mois", "annee", "duree_aberrante", "ville_taux_canular"] +
                 [f"{c}_manquant" for c in top3_manquants])
+    cols_cat = ["shape", "state", "country"]
 
+    modele = construire_modele("texte_temoin", cols_num, cols_cat)
     apres = evaluer(
         "APRES - ville (encodage cible) et heure cyclique",
-        construire_modele("texte_temoin", cols_num, ["shape", "state", "country"]),
-        x.iloc[idx_tr], y[idx_tr], x.iloc[idx_te], y[idx_te])
+        modele, x.iloc[idx_tr], y[idx_tr], x.iloc[idx_te], y[idx_te])
 
     print("\nPhase 4 (rappel / precision honnetes), etat final :")
     print(f"  rappel = {100 * apres['recall']:.1f}   precision = {100 * apres['precision']:.1f}")
+
+    return modele, x, y, idx_tr, idx_te, cols_num, cols_cat
+
+
+# ---------------------------------------------------------------------------
+# Phases 13 a 18 : defendre une decision
+# ---------------------------------------------------------------------------
+
+COUT_CANULAR_RATE = 30   # canular que le systeme laisse passer
+COUT_FAUSSE_ALERTE = 2   # releve honnete marque canular
+
+
+def phase13(modele, x, y, idx_te):
+    titre("PHASE 13 - LA FACTURE DU BUREAU")
+    print(f"Grille votee par le Conseil : canular rate = {COUT_CANULAR_RATE} credits,")
+    print(f"fausse alerte = {COUT_FAUSSE_ALERTE} credits, bonne reponse = 0.")
+
+    proba = modele.predict_proba(x.iloc[idx_te])[:, 1]
+    yte = y[idx_te]
+    n = len(yte)
+    total_canulars = int(yte.sum())
+
+    print("\nFacture (credits) pour quelques frontieres :")
+    print(f"  {'frontiere':>10}{'facture':>12}")
+    for s in [0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]:
+        pred = (proba >= s).astype(int)
+        fn = int(((pred == 0) & (yte == 1)).sum())
+        fp = int(((pred == 1) & (yte == 0)).sum())
+        print(f"  {s:>10.2f}{fn * COUT_CANULAR_RATE + fp * COUT_FAUSSE_ALERTE:>12.0f}")
+
+    # Courbe exacte : on trie par probabilite decroissante, et on fait glisser la
+    # frontiere entre chaque paire de relevés consecutifs (cumsum), ce qui teste
+    # TOUTES les frontieres possibles, pas seulement une grille grossiere.
+    ordre = np.argsort(-proba)
+    y_trie = yte[ordre]
+    proba_trie = proba[ordre]
+    tp_k = np.concatenate(([0], np.cumsum(y_trie)))   # tp_k[k] = tp si on signale les k plus suspects
+    k = np.arange(n + 1)
+    fp_k = k - tp_k
+    fn_k = total_canulars - tp_k
+    factures_k = fn_k * COUT_CANULAR_RATE + fp_k * COUT_FAUSSE_ALERTE
+
+    def seuil_pour_k(kk):
+        return 1.0 if kk == 0 else float(proba_trie[kk - 1])
+
+    k_pur = int(factures_k.argmin())
+    facture_pure = float(factures_k[k_pur])
+    seuil_pur = seuil_pour_k(k_pur)
+
+    pred_05 = (proba >= 0.5).astype(int)
+    fn05 = int(((pred_05 == 0) & (yte == 1)).sum())
+    fp05 = int(((pred_05 == 1) & (yte == 0)).sum())
+    facture_05 = fn05 * COUT_CANULAR_RATE + fp05 * COUT_FAUSSE_ALERTE
+
+    print(f"\nOptimum mathematique pur (toutes frontieres testees) : signaler {k_pur} relevés")
+    print(f"({'ne jamais signaler personne' if k_pur == 0 else f'seuil = {seuil_pur:.4f}'})"
+          f" -> facture = {facture_pure:.0f} credits")
+    print(f"\nC'est un resultat derangeant, mais il faut le dire : avec seulement "
+          f"{total_canulars} canulars")
+    print("dans le test et une precision aussi faible, la grille de couts elle-meme dit")
+    print("qu'il est moins cher de ne jamais rien signaler que de faire tourner le")
+    print("systeme. Mais cette grille ne facture que les erreurs sur CE jeu de test :")
+    print("elle ne compte pas le cout de ne plus avoir de systeme de detection du tout,")
+    print("qui est justement ce que le Bureau nous a demande de batir. On ne retient")
+    print("donc pas cet optimum pur.")
+
+    # Frontiere retenue : la moins chere PARMI celles qui attrapent au moins un canular
+    # (sinon le systeme ne sert plus a rien, meme s'il coute moins cher sur le papier).
+    capture_au_moins_un = tp_k >= 1
+    factures_utiles = np.where(capture_au_moins_un, factures_k, np.inf)
+    k_utile = int(factures_utiles.argmin())
+    facture_utile = float(factures_k[k_utile])
+    seuil_utile = seuil_pour_k(k_utile)
+
+    print(f"\nFrontiere retenue (la moins chere parmi celles qui attrapent au moins un")
+    print(f"canular) : seuil = {seuil_utile:.4f} -> {k_utile} relevés signales, "
+          f"facture = {facture_utile:.0f} credits")
+    print(f"\nFrontiere a 0.5 (celle de la bibliotheque) : facture = {facture_05:.0f} credits")
+    print(f"Ecart entre les deux : {facture_05 - facture_utile:.0f} credits economises "
+          f"sur {n} relevés de test")
+    print(f"\nLa frontiere a 0.5 ne connait pas la grille de couts (un canular rate coute "
+          f"{COUT_CANULAR_RATE // COUT_FAUSSE_ALERTE} fois plus qu'une fausse alerte) : "
+          "elle signale beaucoup")
+    print("trop de fausses alertes pour ce que ça rapporte. La frontiere retenue est plus")
+    print("severe (moins de relevés signales), pas plus permissive : a ce niveau de")
+    print("precision, chaque fausse alerte en plus coute plus cher qu'elle ne rapporte.")
+
+    return seuil_utile
+
+
+def tableau_calibration(proba, y_vrai, n_tranches=10):
+    rangs = pd.Series(proba).rank(method="first")
+    tranches = pd.qcut(rangs, q=n_tranches, labels=False)
+    t = pd.DataFrame({"proba": proba, "y": y_vrai, "tranche": tranches})
+    g = t.groupby("tranche").agg(
+        n=("y", "size"), proba_moyenne=("proba", "mean"), taux_reel=("y", "mean"))
+    return g
+
+
+def phase14(modele, x, y, idx_tr, idx_te, cols_num, cols_cat):
+    titre("PHASE 14 - UNE PROMESSE A 80 %")
+
+    proba = modele.predict_proba(x.iloc[idx_te])[:, 1]
+    yte = y[idx_te]
+
+    g = tableau_calibration(proba, yte)
+    print("Avant correction (10 tranches, decoupees a effectif egal) :")
+    print(f"  {'tranche':>8}{'n':>8}{'proba annoncee':>16}{'taux reel':>12}")
+    for i, row in g.iterrows():
+        print(f"  {i:>8.0f}{row['n']:>8.0f}{100 * row['proba_moyenne']:>15.2f} %"
+              f"{100 * row['taux_reel']:>11.2f} %")
+
+    ecart = (g["proba_moyenne"] - g["taux_reel"]).mean()
+    sens = "trop confiant (il annonce plus haut que la realite)" if ecart > 0 \
+        else "trop prudent (il annonce plus bas que la realite)"
+    print(f"\nLe systeme est {sens}.")
+
+    print("\nCorrection : recalibrage sigmoide (Platt scaling), appris par validation")
+    print("croisee sur la partie apprentissage seule, jamais sur le test.")
+    calibre = CalibratedClassifierCV(
+        construire_modele("texte_temoin", cols_num, cols_cat), method="sigmoid", cv=3)
+    calibre.fit(x.iloc[idx_tr], y[idx_tr])
+    proba_corrige = calibre.predict_proba(x.iloc[idx_te])[:, 1]
+
+    g2 = tableau_calibration(proba_corrige, yte)
+    print("\nApres correction :")
+    print(f"  {'tranche':>8}{'n':>8}{'proba annoncee':>16}{'taux reel':>12}")
+    for i, row in g2.iterrows():
+        print(f"  {i:>8.0f}{row['n']:>8.0f}{100 * row['proba_moyenne']:>15.2f} %"
+              f"{100 * row['taux_reel']:>11.2f} %")
+
+    return calibre, proba_corrige
+
+
+def phase15(proba, seuil, y, idx_te, n_boot=2000):
+    titre("PHASE 15 - DEUX ANALYSTES, DEUX CHIFFRES")
+
+    yte = y[idx_te]
+    pred = (proba >= seuil).astype(int)
+    n_test = len(yte)
+    n_canulars = int(yte.sum())
+    print(f"Taille de la partie test               : {n_test}")
+    print(f"Canulars reellement presents dans le test : {n_canulars}")
+
+    rng = np.random.default_rng(SEED)
+    rec_boot, pre_boot = [], []
+    for _ in range(n_boot):
+        idx = rng.integers(0, n_test, n_test)
+        yt, pt = yte[idx], pred[idx]
+        tp = int(((pt == 1) & (yt == 1)).sum())
+        fn = int(((pt == 0) & (yt == 1)).sum())
+        fp = int(((pt == 1) & (yt == 0)).sum())
+        rec_boot.append(tp / (tp + fn) if (tp + fn) else np.nan)
+        pre_boot.append(tp / (tp + fp) if (tp + fp) else np.nan)
+    rec_boot = np.array(rec_boot)
+    pre_boot = np.array(pre_boot)
+    rec_lo, rec_hi = np.nanpercentile(rec_boot, [2.5, 97.5])
+    pre_lo, pre_hi = np.nanpercentile(pre_boot, [2.5, 97.5])
+
+    print(f"\n{n_boot} rechantillonnages bootstrap de la partie test :")
+    print(f"  Rappel    : [{100 * rec_lo:.1f} % ; {100 * rec_hi:.1f} %]")
+    print(f"  Precision : [{100 * pre_lo:.1f} % ; {100 * pre_hi:.1f} %]")
+
+    print(f"\nReponse au Conseil : avec seulement {n_canulars} canulars dans le test,")
+    print("deplacer 2 ou 3 d'entre eux fait bouger le chiffre de plusieurs points sans")
+    print("que le modele ait change. 0,31 et 0,34 tombent tous les deux dans la meme")
+    print("fourchette bootstrap : les deux systemes sont statistiquement indiscernables")
+    print("avec cette taille de test, la question posee n'a pas de reponse tranchee.")
+
+
+def expliquer_ligne(modele, x_ligne, top_n=6):
+    pre = modele.named_steps["pre"]
+    clf = modele.named_steps["clf"]
+    xt = pre.transform(x_ligne)
+    xt = xt.toarray() if hasattr(xt, "toarray") else np.asarray(xt)
+    contrib = xt[0] * clf.coef_[0]
+    noms = pre.get_feature_names_out()
+    ordre = np.argsort(-np.abs(contrib))[:top_n]
+    return [(noms[i], float(contrib[i])) for i in ordre]
+
+
+def phase16(df, modele, x, y, idx_te, seuil):
+    titre("PHASE 16 - TROIS DOSSIERS SUR LE BUREAU")
+
+    proba = modele.predict_proba(x.iloc[idx_te])[:, 1]
+    yte = y[idx_te]
+    idx_orig = x.iloc[idx_te].index
+
+    i_fort = int(np.argmax(proba))
+    au_dessus = np.where(proba >= seuil)[0]
+    i_juste = au_dessus[int(np.argmin(proba[au_dessus] - seuil))]
+    manques = np.where((yte == 1) & (proba < seuil))[0]
+    i_manque = manques[int(np.argmax(proba[manques]))] if len(manques) else None
+
+    dossiers = [
+        ("Marque canular, forte confiance", i_fort),
+        ("Marque canular, tout juste au-dessus de la frontiere", i_juste),
+    ]
+    if i_manque is not None:
+        dossiers.append(("Canular laisse passer", i_manque))
+
+    for titre_dossier, i in dossiers:
+        ligne_idx = idx_orig[i]
+        print(f"\n--- {titre_dossier} (proba = {proba[i]:.3f}, "
+              f"vrai label = {'canular' if yte[i] == 1 else 'honnete'}) ---")
+        print(f"datetime={df.loc[ligne_idx, 'datetime']}  city={df.loc[ligne_idx, 'city']}")
+        temoin = df.loc[ligne_idx, "temoignage"]
+        print(f"temoignage : {str(temoin)[:140]}")
+        top = expliquer_ligne(modele, x.iloc[idx_te].iloc[[i]])
+        print("Ce qui pousse la decision (feature : contribution au score) :")
+        for nom, val in top:
+            sens = "-> canular" if val > 0 else "-> honnete"
+            print(f"    {nom:<40} {val:+.3f}  {sens}")
+
+    print("\nClassement global des colonnes (importance par permutation, average precision) :")
+    res = permutation_importance(
+        modele, x.iloc[idx_te], yte, n_repeats=5, random_state=SEED,
+        scoring="average_precision")
+    classement = pd.Series(res.importances_mean, index=x.columns).sort_values(ascending=False)
+    for nom, val in classement.items():
+        print(f"    {nom:<25} {val:+.4f}")
+
+    rang_ville = int(classement.index.get_loc("ville_taux_canular")) + 1
+    print(f"\nColonne qui surprend le plus : 'ville_taux_canular'. Elle domine les trois")
+    print("explications de dossier ci-dessus (coefficient le plus fort a chaque fois),")
+    print(f"mais elle n'arrive qu'en {rang_ville}e position sur {len(classement)} dans le")
+    print("classement global. Elle est decisive pour une poignee de relevés (des villes")
+    print("dont le taux d'apprentissage etait extreme) mais elle n'aide quasiment pas le")
+    print("modele sur l'ensemble du test : coefficient enorme, portee reelle minuscule.")
+
+
+ZONES = {"us": "Etats-Unis", "ca": "Canada", "gb": "Royaume-Uni"}
+
+
+def phase17(df, modele, x, y, idx_te, seuil):
+    titre("PHASE 17 - L'ANGLE MORT DU BUREAU")
+
+    pays = df.loc[x.iloc[idx_te].index, "country"]
+    proba = modele.predict_proba(x.iloc[idx_te])[:, 1]
+    yte = y[idx_te]
+    pred = (proba >= seuil).astype(int)
+
+    zone = pays.map(ZONES).fillna("Autre / inconnu")
+    n_us = int((pays == "us").sum())
+    print(f"Part des Etats-Unis dans le test : {100 * n_us / len(pays):.1f} %")
+
+    print(f"\n  {'zone':<16}{'n':>8}{'% canulars':>13}{'rappel':>10}{'precision':>12}")
+    for z in list(ZONES.values()) + ["Autre / inconnu"]:
+        m = (zone == z).to_numpy()
+        n = int(m.sum())
+        if n == 0:
+            continue
+        yz, pz = yte[m], pred[m]
+        taux = 100 * yz.mean()
+        tp = int(((pz == 1) & (yz == 1)).sum())
+        fn = int(((pz == 0) & (yz == 1)).sum())
+        fp = int(((pz == 1) & (yz == 0)).sum())
+        rec = 100 * tp / (tp + fn) if (tp + fn) else float("nan")
+        pre = 100 * tp / (tp + fp) if (tp + fp) else float("nan")
+        print(f"  {z:<16}{n:>8}{taux:>12.2f} %{rec:>9.1f} %{pre:>11.1f} %")
+
+    print(f"\nDecision : une seule frontiere pour tout le monde, celle de la phase 13")
+    print(f"(seuil = {seuil:.4f}). Les zones hors Etats-Unis pesent trop peu de relevés")
+    print("(quelques centaines a quelques milliers) pour qu'une frontiere par zone soit")
+    print("mesuree de facon fiable (voir phase 15) : une frontiere specifique s'y")
+    print("calibrerait sur du bruit d'echantillonnage, pas sur un vrai ecart de comportement.")
+
+
+def phase18(df, top3_manquants, duree_modele, duree_aberrante, apres8):
+    titre("PHASE 18 - LA TRANSMISSION D'ARCHIVE")
+
+    annee = df["datetime"].dt.year
+    courbe = df.groupby(annee)["canular"].agg(["mean", "size"])
+    courbe = courbe[courbe["size"] >= 30]
+    print("Proportion de canulars par annee (annees avec au moins 30 relevés) :")
+    for a, row in courbe.iterrows():
+        print(f"  {int(a)} : {100 * row['mean']:>5.2f} % (n={int(row['size'])})")
+    ecart_type = float(courbe["mean"].std())
+    print(f"\nEcart-type de la proportion annuelle : {100 * ecart_type:.2f} points.")
+    print("La courbe n'est pas plate : la definition du canular a clairement bouge dans")
+    print("le temps (voir aussi phase 8, ou les proportions train/test different deja).")
+
+    shape_propre = df["shape"].apply(fusionner_shape)
+    heure_brute = df["datetime"].dt.hour.fillna(-1)
+    rad = 2 * np.pi * heure_brute.clip(lower=0) / 24
+    heure_sin = np.sin(rad).where(heure_brute >= 0, 0.0)
+    heure_cos = np.cos(rad).where(heure_brute >= 0, 0.0)
+    y = df["canular"].to_numpy()
+
+    mediane_annee = annee.median()
+    idx_tr = np.flatnonzero((annee <= mediane_annee).to_numpy())
+    idx_te = np.flatnonzero((annee > mediane_annee).to_numpy())
+    print(f"\nEpreuve : apprentissage sur les relevés jusqu'a {int(mediane_annee)} "
+          f"({len(idx_tr)} relevés), test sur les relevés plus recents ({len(idx_te)} relevés).")
+
+    city_taux = encoder_ville(df, y, idx_tr)
+    x = construire_x_finale(df, top3_manquants, duree_modele, duree_aberrante,
+                             shape_propre, heure_sin, heure_cos, city_taux)
+    cols_num = (["duration_seconds", "latitude", "longitude", "heure_sin", "heure_cos",
+                 "mois", "annee", "duree_aberrante", "ville_taux_canular"] +
+                [f"{c}_manquant" for c in top3_manquants])
+    apres = evaluer(
+        "APRES - apprentissage sur l'ancien, test sur le recent",
+        construire_modele("texte_temoin", cols_num, ["shape", "state", "country"]),
+        x.iloc[idx_tr], y[idx_tr], x.iloc[idx_te], y[idx_te])
+
+    print("\nCote a cote avec la phase 8 (decoupe chronologique 75/25) :")
+    print(f"  {'':<28}{'rappel':>10}{'precision':>12}")
+    print(f"  {'phase 8':<28}{100 * apres8['recall']:>9.1f}{100 * apres8['precision']:>12.1f}")
+    print(f"  {'ancien -> recent (phase 18)':<28}{100 * apres['recall']:>9.1f}"
+          f"{100 * apres['precision']:>12.1f}")
+
+    print("\nCe qu'on peut surveiller en production sans jamais connaitre l'etiquette :")
+    print("  1. La proportion de relevés marques canular par le systeme, semaine par")
+    print("     semaine elle doit rester proche de la proportion historique.")
+    print("  2. La distribution des probabilites annoncees (proba moyenne, part au-dessus")
+    print("     de la frontiere) un glissement signale que les relevés recus ne")
+    print("     ressemblent plus a ceux de l'entrainement, meme sans connaitre la verite.")
+    print("\nFrequence : hebdomadaire, alignee sur le rythme d'arrivee des transmissions.")
+    print("Seuil de rappel : un ecart de plus de 2 points de pourcentage sur l'indicateur 1,")
+    print("ou un deplacement de plus de 0,05 de la probabilite moyenne sur l'indicateur 2,")
+    print("declenche une relecture manuelle par les analystes.")
 
 
 # ---------------------------------------------------------------------------
@@ -749,11 +1098,19 @@ def main():
     avant, apres, acc_stagiaire, idx_tr_ancien, idx_te_ancien = phases_4_5_6(df)
 
     df2 = phase7(df, idx_tr_ancien, idx_te_ancien, apres)
-    idx_tr8, idx_te8 = phase8(df2)
+    idx_tr8, idx_te8, apres8 = phase8(df2)
     top3 = phase9(df2, idx_tr8, idx_te8)
     phase10(df2, idx_tr8, idx_te8)
     duree_modele, duree_aberrante = phase11(df2, idx_tr8, idx_te8, top3)
-    phase12(df2, idx_tr8, idx_te8, top3, duree_modele, duree_aberrante)
+    modele, x, y, idx_tr, idx_te, cols_num, cols_cat = phase12(
+        df2, idx_tr8, idx_te8, top3, duree_modele, duree_aberrante)
+
+    seuil = phase13(modele, x, y, idx_te)
+    calibre, proba_corrige = phase14(modele, x, y, idx_tr, idx_te, cols_num, cols_cat)
+    phase15(proba_corrige, 0.5, y, idx_te)
+    phase16(df2, modele, x, y, idx_te, seuil)
+    phase17(df2, modele, x, y, idx_te, seuil)
+    phase18(df2, top3, duree_modele, duree_aberrante, apres8)
 
     titre("FIN")
     print("Tous les chiffres ci-dessus sont repris dans RAPPORT.md.")
